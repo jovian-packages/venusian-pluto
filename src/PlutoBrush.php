@@ -11,12 +11,10 @@ use Surface\Contracts\Rendering\Framebuffers\Region;
 use Surface\Contracts\Rendering\Framebuffers\ScanDirection;
 use Surface\Contracts\Rendering\Painting\Brush;
 use Surface\Contracts\Rendering\Rasterization\Edges;
-use Surface\Contracts\Rendering\Rasterization\Scanner;
 use Surface\Contracts\Rendering\RenderingException;
 use Surface\NutsAndBolts\GradientSpread;
-use Surface\Rendering\Rasterization\Rasterizer;
-use Surface\VelvetGE\Drivers\Rasterization\PHPLandRasterizationDriver;
-use Surface\VelvetGE\Framebuffers\Layout;
+use VelvetGE\Rasterization\Rasterizer;
+use VelvetGE\Framebuffers\Layout;
 use ValueError;
 
 /**
@@ -26,10 +24,10 @@ use ValueError;
  * 32-bit memory with VelvetGE's arithmetic (plutovg_surface_blend_colour / _ramp), so those pixels
  * differ from VelvetGE's by PlutoVG's edge coverage alone.
  *
- * Shapes are prepared exactly as the rasterizer prepares them (Rasterizer::lower()): radii held,
- * a stroke turned into its outline. The brush takes anti-aliased path, gradpath, polyline, ellipse,
- * ring, roundrect and roundring commands; PlutoVG has no hard-edge mode, so hard edges, and clear,
- * shadow, glass, layer, image, glyphs and spans, are VelvetGE's painter's.
+ * Shapes are prepared by PlutoVG's rasterizer (Rasterizer::lower() with PlutoVGScanner): radii
+ * held, a stroke turned into its outline, curves as PlutoVG geometry (PlutoShapes). The brush takes
+ * anti-aliased path, gradpath, polyline, ellipse, ring, roundrect and roundring commands; hard
+ * edges, and clear, shadow, glass, layer, image, glyphs and spans, are VelvetGE's painter's.
  */
 final class PlutoBrush implements Brush
 {
@@ -45,9 +43,6 @@ final class PlutoBrush implements Brush
 
     /** The commands painted, and where each holds its clip. */
     private const array SHAPES = ['path' => 4, 'gradpath' => 4, 'polyline' => 5, 'ellipse' => 6, 'ring' => 7, 'roundrect' => 7, 'roundring' => 8];
-
-    /** A cubic's control distance for a quarter circle of radius 1. */
-    private const float KAPPA = 0.5522847498307936;
 
     /** @var array<string, Rasterizer> by clip: what lowers a command's shape */
     private array $lowering = [];
@@ -103,7 +98,7 @@ final class PlutoBrush implements Brush
     /** One command inside $cut: its shape's coverage from PlutoVG, blended into the memory. */
     private function command(array $command, Region $cut, Edges $edges, PixelMemory $memory, int $order, ?\plutovg_canvas $canvas): ?Region
     {
-        $rasterizer = $this->lowering["{$cut->x},{$cut->y},{$cut->width},{$cut->height}"] ??= (new PHPLandRasterizationDriver())->rasterizer($cut, $edges);
+        $rasterizer = $this->lowering["{$cut->x},{$cut->y},{$cut->width},{$cut->height}"] ??= (new PlutoVGRasterizationDriver())->rasterizer($cut, $edges);
         $gradient = $command[0] === 'gradpath';
         [$ops, $colours] = $rasterizer->lower([$gradient ? ['path', $command[1], $command[2], 0, $cut] : $command]);
         if ($ops === []) {
@@ -155,94 +150,7 @@ final class PlutoBrush implements Brush
     {
         plutovg_path_reset($this->path);
 
-        return match ($op[0]) {
-            Scanner::PATH => $this->contours($op[1], $op[2]),
-            Scanner::ELLIPSE => $this->ellipse($op[1], $op[2], $op[3], $op[4]),
-            Scanner::RING => $this->ring($op[1], $op[2], $op[3], $op[4], $op[5]),
-            Scanner::ROUND_RECT => $this->roundRect($op[1], $op[2], $op[3], $op[4], $op[5]),
-            Scanner::ROUND_RING => $this->roundRing($op[1], $op[2], $op[3], $op[4], $op[5], $op[6]),
-            default => throw new RenderingException("PlutoBrush has no shape for scanner op {$op[0]}."),
-        };
-    }
-
-    /** @param list<list<float>> $contours flat x, y lists, each closed */
-    private function contours(array $contours, int $evenOdd): int
-    {
-        foreach ($contours as $flat) {
-            plutovg_path_move_to($this->path, $flat[0], $flat[1]);
-            for ($i = 2, $n = count($flat); $i < $n; $i += 2) {
-                plutovg_path_line_to($this->path, $flat[$i], $flat[$i + 1]);
-            }
-            plutovg_path_close($this->path);
-        }
-
-        return $evenOdd === 1 ? PLUTOVG_FILL_RULE_EVEN_ODD : PLUTOVG_FILL_RULE_NON_ZERO;
-    }
-
-    private function ellipse(float $cx, float $cy, float $rx, float $ry): int
-    {
-        plutovg_path_add_ellipse($this->path, $cx, $cy, $rx, $ry);
-
-        return PLUTOVG_FILL_RULE_NON_ZERO;
-    }
-
-    /** The band between radii r ± stroke / 2; all of the outer ellipse when the inner one vanishes. */
-    private function ring(float $cx, float $cy, float $rx, float $ry, float $stroke): int
-    {
-        $half = $stroke / 2;
-        plutovg_path_add_ellipse($this->path, $cx, $cy, $rx + $half, $ry + $half);
-        if ($rx - $half > 0 && $ry - $half > 0) {
-            plutovg_path_add_ellipse($this->path, $cx, $cy, $rx - $half, $ry - $half);
-        }
-
-        return PLUTOVG_FILL_RULE_EVEN_ODD;
-    }
-
-    /** @param array{float, float, float, float} $radii top-left, top-right, bottom-right, bottom-left, already held to the box */
-    private function roundRect(float $x0, float $y0, float $x1, float $y1, array $radii): int
-    {
-        $this->addRoundRect($x0, $y0, $x1, $y1, array_values($radii));
-
-        return PLUTOVG_FILL_RULE_NON_ZERO;
-    }
-
-    /** The band inside the box, $inset wide: the inner box's radii are max(0, r − inset). */
-    private function roundRing(float $x0, float $y0, float $x1, float $y1, array $radii, float $inset): int
-    {
-        $r = array_values($radii);
-        $this->addRoundRect($x0, $y0, $x1, $y1, $r);
-        [$ix0, $iy0, $ix1, $iy1] = [$x0 + $inset, $y0 + $inset, $x1 - $inset, $y1 - $inset];
-        if ($ix1 > $ix0 && $iy1 > $iy0) {
-            $this->addRoundRect($ix0, $iy0, $ix1, $iy1, array_map(fn (float $v): float => max(0.0, $v - $inset), $r));
-        }
-
-        return PLUTOVG_FILL_RULE_EVEN_ODD;
-    }
-
-    /** @param list<float> $r top-left, top-right, bottom-right, bottom-left: circular corners */
-    private function addRoundRect(float $x0, float $y0, float $x1, float $y1, array $r): void
-    {
-        [$tl, $tr, $br, $bl] = $r;
-        $k = self::KAPPA;
-        $p = $this->path;
-        plutovg_path_move_to($p, $x0 + $tl, $y0);
-        plutovg_path_line_to($p, $x1 - $tr, $y0);
-        if ($tr > 0) {
-            plutovg_path_cubic_to($p, $x1 - $tr + $tr * $k, $y0, $x1, $y0 + $tr - $tr * $k, $x1, $y0 + $tr);
-        }
-        plutovg_path_line_to($p, $x1, $y1 - $br);
-        if ($br > 0) {
-            plutovg_path_cubic_to($p, $x1, $y1 - $br + $br * $k, $x1 - $br + $br * $k, $y1, $x1 - $br, $y1);
-        }
-        plutovg_path_line_to($p, $x0 + $bl, $y1);
-        if ($bl > 0) {
-            plutovg_path_cubic_to($p, $x0 + $bl - $bl * $k, $y1, $x0, $y1 - $bl + $bl * $k, $x0, $y1 - $bl);
-        }
-        plutovg_path_line_to($p, $x0, $y0 + $tl);
-        if ($tl > 0) {
-            plutovg_path_cubic_to($p, $x0, $y0 + $tl - $tl * $k, $x0 + $tl - $tl * $k, $y0, $x0 + $tl, $y0);
-        }
-        plutovg_path_close($p);
+        return PlutoShapes::add($this->path, $op);
     }
 
     /**

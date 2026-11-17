@@ -2,18 +2,15 @@
 
 namespace Jovian\Rendering\Pluto;
 
-use RasterScanner;
 use Surface\Contracts\Rendering\Framebuffers\Region;
 use Surface\Contracts\Rendering\Rasterization\Edges;
 use Surface\Contracts\Rendering\Rasterization\RasterizeException;
 use Surface\Contracts\Rendering\Rasterization\Scanner;
-use Surface\VelvetGE\Drivers\Rasterization\ScannerRasterizationDriver;
-use Surface\VelvetGE\Rasterize\CLandScanner;
-use Surface\VelvetGE\Rasterize\PHPLandScanner;
+use VelvetGE\Rasterization\ScannerRasterizationDriver;
 
 /**
- * 'plutovg': paths filled by PlutoVG through ext-plutovg. PlutoVG always anti-aliases, so hard
- * edges are VelvetGE's (ext-rasterize's scanner when loaded, else the PHP one).
+ * 'plutovg': paths and curved shapes filled by PlutoVG through ext-plutovg, always anti-aliased:
+ * PlutoVG has no hard-edged mode, so a request for hard edges is drawn anti-aliased too.
  */
 class PlutoVGRasterizationDriver extends ScannerRasterizationDriver
 {
@@ -31,10 +28,6 @@ class PlutoVGRasterizationDriver extends ScannerRasterizationDriver
 
     protected function scanner(Region $clip, Edges $edges): Scanner
     {
-        if ($edges === Edges::HARD) {
-            return class_exists(RasterScanner::class) ? new CLandScanner($clip, $edges) : new PHPLandScanner($clip, $edges);
-        }
-
-        return new PlutoVGScanner($clip, $edges);
+        return new PlutoVGScanner($clip);
     }
 }

@@ -12,21 +12,28 @@ use Surface\Contracts\Rendering\Rasterization\Edges;
 use Surface\Contracts\Rendering\Rasterization\FillRule;
 use Surface\Contracts\Rendering\Rasterization\MaskScanner;
 use Surface\Contracts\Rendering\Rasterization\Scanner;
-use Surface\VelvetGE\Framebuffers\Layout;
+use Surface\Contracts\Rendering\Rasterization\ShapeScanner;
+use VelvetGE\Framebuffers\Layout;
 
 /**
- * Fills paths with PlutoVG's anti-aliased rasteriser. A path is filled in opaque white onto a scratch
- * surface the size of its extents inside the clip, and plutovg_surface_get_alpha() reads that back as
- * a8 coverage in one C call. mask() answers the a8 as it is (VelvetGE lands it with the store's
- * paintMasks()); path() run-length encodes the same bytes into spans. Both come from one render, so
- * they are the same coverage. The other tiers come from VelvetGE through the completing scanner.
+ * Fills paths, ellipses, rings, round rects and round rings with PlutoVG's rasteriser, as PlutoVG
+ * geometry (PlutoShapes). A shape is filled in opaque white onto a scratch surface the size of its
+ * extents inside the clip, and plutovg_surface_get_alpha() reads that back as a8 coverage in one C
+ * call. mask() answers the a8 as it is (VelvetGE lands it with the store's paintMasks()); path(),
+ * ellipse(), ring(), roundRect() and roundRing() run-length encode the same bytes into spans. Both
+ * come from one render, so they are the same coverage.
  *
- * Into B G R A memory (PlutoVG's own pixel layout on a little-endian host) fill() draws the paths
- * in place instead. PlutoVG's premultiplied source-over on the stored bytes is VelvetGE's blend:
- * measured 2026-11-13 over 3,000 translucent polygons on pixels of every alpha, at most BLEND off
- * per byte from VelvetGE blending PlutoVG's own coverage (99.9% of differing bytes 1 off).
+ * PlutoVG always anti-aliases, so edges() answers Edges::ANTIALIASED whatever was asked for and
+ * that is what it draws. PlutoVG has no shadow, which Velvet hands back undrawn. One-pixel lines
+ * belong to hard edges, so it is never asked for one: a thin stroke reaches it as an outline.
+ *
+ * Into B G R A memory (PlutoVG's own pixel layout on a little-endian host) fill() draws shapes in
+ * place instead. PlutoVG's premultiplied source-over on the stored bytes is VelvetGE's blend:
+ * measured 2026-11-15 over 20,000 translucent polygons on pixels of every alpha, at most BLEND off
+ * per byte from VelvetGE blending PlutoVG's own coverage (99.94% of differing bytes 1 off, 0.06% 2
+ * off, and 2 bytes in 9 million 3 off, on a pixel of alpha 12).
  */
-class PlutoVGScanner implements DirectScanner, MaskScanner
+class PlutoVGScanner implements DirectScanner, MaskScanner, ShapeScanner
 {
     /**
      * Greatest coverage difference from VelvetGE's scanner at any pixel of a simple shape (measured
@@ -37,14 +44,13 @@ class PlutoVGScanner implements DirectScanner, MaskScanner
     public const int TOLERANCE = 11;
 
     /** Greatest per-byte distance between drawing in place and VelvetGE blending the same coverage. */
-    public const int BLEND = 2;
+    public const int BLEND = 3;
 
     /** Scratch surfaces are at most this wide and high (PlutoVG refuses 2^15; 4096² is 64 MiB). */
     private const int TILE = 4096;
 
     public function __construct(
         private readonly Region $clip,
-        private readonly Edges $edges,
     ) {}
 
     public function clip(): Region
@@ -54,12 +60,50 @@ class PlutoVGScanner implements DirectScanner, MaskScanner
 
     public function edges(): Edges
     {
-        return $this->edges;
+        return Edges::ANTIALIASED;
     }
 
     public function path(array $contours, FillRule $rule): string
     {
-        $coverage = $this->coverage($contours, $rule === FillRule::EVEN_ODD);
+        return $this->spans([Scanner::PATH, $contours, $rule === FillRule::EVEN_ODD ? 1 : 0]);
+    }
+
+    public function ellipse(float $cx, float $cy, float $rx, float $ry): string
+    {
+        return $this->spans([Scanner::ELLIPSE, $cx, $cy, $rx, $ry]);
+    }
+
+    public function ring(float $cx, float $cy, float $rx, float $ry, float $stroke): string
+    {
+        return $this->spans([Scanner::RING, $cx, $cy, $rx, $ry, $stroke]);
+    }
+
+    public function roundRect(float $x0, float $y0, float $x1, float $y1, array $radii): string
+    {
+        return $this->spans([Scanner::ROUND_RECT, $x0, $y0, $x1, $y1, $radii]);
+    }
+
+    public function roundRing(float $x0, float $y0, float $x1, float $y1, array $radii, float $inset): string
+    {
+        return $this->spans([Scanner::ROUND_RING, $x0, $y0, $x1, $y1, $radii, $inset]);
+    }
+
+    /** @param list<mixed> $op a PATH, ELLIPSE, RING, ROUND_RECT or ROUND_RING op */
+    public function mask(array $op): ?array
+    {
+        $coverage = $this->coverage($op);
+        if ($coverage === null) {
+            return null;
+        }
+        [$a8, $area] = $coverage;
+
+        return [$a8, $area->width, $area->x, $area->y];
+    }
+
+    /** The op's coverage run-length encoded into spans. */
+    private function spans(array $op): string
+    {
+        $coverage = $this->coverage($op);
         if ($coverage === null) {
             return '';
         }
@@ -80,32 +124,19 @@ class PlutoVGScanner implements DirectScanner, MaskScanner
         return $spans;
     }
 
-    /** @param list<mixed> $op [Scanner::PATH, list of flat contours, 0 non-zero | 1 even-odd] */
-    public function mask(array $op): ?array
-    {
-        if (($op[0] ?? null) !== Scanner::PATH) {
-            return null;
-        }
-        $coverage = $this->coverage($op[1], (int) $op[2] === 1);
-        if ($coverage === null) {
-            return null;
-        }
-        [$a8, $area] = $coverage;
-
-        return [$a8, $area->width, $area->x, $area->y];
-    }
-
-    /** B G R A rows, top row first, a whole number of pixels apart, on a little-endian host. */
+    /**
+     * B G R A rows, top row first, a whole number of pixels apart, on a little-endian host.
+     */
     public function drawsInto(PixelMemory $memory): bool
     {
         return self::inPlace($memory);
     }
 
     /**
-     * Each path drawn into $memory by PlutoVG, inside the clip. The region answered for an op is its
+     * Each shape drawn into $memory by PlutoVG, inside the clip. The region answered for an op is its
      * extents inside the clip: every pixel it changed is in there.
      *
-     * @param  list<list<mixed>>  $ops  PATH ops
+     * @param  list<list<mixed>>  $ops  PATH, ELLIPSE, RING, ROUND_RECT or ROUND_RING ops
      * @param  list<int>  $colours  0xRRGGBBAA
      */
     public function fill(array $ops, array $colours, PixelMemory $memory): array
@@ -117,14 +148,15 @@ class PlutoVGScanner implements DirectScanner, MaskScanner
         $canvas = self::canvasOver($memory, $clip);
         $touched = [];
         foreach ($ops as $i => $op) {
-            $path = self::path_of($op[1]);
+            $path = plutovg_path_create();
+            $rule = PlutoShapes::add($path, $op);
             $area = ($colours[$i] & 0xFF) === 0 ? null : self::extents($path)?->intersect($clip);
             if (is_null($area) || $area->isEmpty()) {
                 $touched[] = null;
 
                 continue;
             }
-            self::paint($canvas, $path, (int) $op[2] === 1 ? PLUTOVG_FILL_RULE_EVEN_ODD : PLUTOVG_FILL_RULE_NON_ZERO, $colours[$i]);
+            self::paint($canvas, $path, $rule, $colours[$i]);
             $touched[] = $area;
         }
 
@@ -177,41 +209,22 @@ class PlutoVGScanner implements DirectScanner, MaskScanner
         return $bounds->isEmpty() ? null : $bounds;
     }
 
-    /** @param list<list<float>> $contours flat x, y lists, closed implicitly */
-    private static function path_of(array $contours): \plutovg_path
-    {
-        $path = plutovg_path_create();
-        foreach ($contours as $contour) {
-            $n = intdiv(count($contour), 2);
-            if ($n < 2) {
-                continue;
-            }
-            plutovg_path_move_to($path, $contour[0], $contour[1]);
-            for ($i = 1; $i < $n; $i++) {
-                plutovg_path_line_to($path, $contour[2 * $i], $contour[2 * $i + 1]);
-            }
-            plutovg_path_close($path);
-        }
-
-        return $path;
-    }
-
     /**
-     * The path's a8 coverage over its extents inside the clip, rows packed, or null when it covers
+     * The op's a8 coverage over its extents inside the clip, rows packed, or null when it covers
      * no pixel there.
      *
-     * @param  list<list<float>>  $contours  flat x, y lists, closed implicitly
+     * @param  list<mixed>  $op
      * @return array{string, Region}|null
      */
-    private function coverage(array $contours, bool $even_odd): ?array
+    private function coverage(array $op): ?array
     {
-        $path = self::path_of($contours);
+        $path = plutovg_path_create();
+        $winding = PlutoShapes::add($path, $op);
         $area = self::extents($path)?->intersect($this->clip);
         if ($area === null || $area->isEmpty()) {
             return null;
         }
 
-        $winding = $even_odd ? PLUTOVG_FILL_RULE_EVEN_ODD : PLUTOVG_FILL_RULE_NON_ZERO;
         if ($area->width <= self::TILE && $area->height <= self::TILE) {
             $a8 = $this->tile($path, $winding, $area->x, $area->y, $area->width, $area->height);
         } else {
