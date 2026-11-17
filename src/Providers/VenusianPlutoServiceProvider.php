@@ -3,6 +3,7 @@
 namespace Jovian\Rendering\Pluto\Providers;
 
 use Jovian\Rendering\Pluto\Framebuffers\PlutoVGFramebufferDriver;
+use Jovian\Rendering\Pluto\Images\PlutoImageDecoderDriver;
 use Jovian\Rendering\Pluto\PlutoPaintingDriver;
 use Jovian\Rendering\Pluto\PlutoVGRasterizationDriver;
 use Jovian\Rendering\Pluto\Stroking\PlutoVGStrokingDriver;
@@ -31,6 +32,7 @@ class VenusianPlutoServiceProvider extends ServiceProvider
         $this->registerVelvetRasterizationDriver();
         $this->registerVelvetPaintbrushDriver();
         $this->registerStrokingDriver();
+        $this->registerImageDecoder();
     }
 
     /** 'plutovg' on Velvet's framebuffers.
@@ -62,6 +64,15 @@ class VenusianPlutoServiceProvider extends ServiceProvider
      *
      * @throws ReflectionException
      */
+    /** 'plutovg' on Images' decoders. PNG and JPEG, PlutoVG's premultiplied bytes, source operator. */
+    protected function registerImageDecoder(): void
+    {
+        if (! extension_loaded('plutovg')) {
+            return;
+        }
+        app('images.decoders')->extend('plutovg', fn () => new PlutoImageDecoderDriver());
+    }
+
     protected function registerStrokingDriver(): void
     {
         app('strokers')->extend('plutovg', fn () => new PlutoVGStrokingDriver());

@@ -23,6 +23,10 @@ The service provider registers `plutovg` on Velvet's framebuffer, rasterization 
 
 Coverage at a shape's edge is PlutoVG's own arithmetic. On simple shapes every pixel is within 11 of VelvetGE's (out of 255). Where a path's contours overlap inside one pixel (a self-crossing polygon, the joins of a stroked polyline), PlutoVG adds the overlapping coverage, so that pixel can be up to 220 brighter. Under 1% of a shape's pixels are affected, and its total area stays within 0.5%.
 
+## Images
+
+`plutovg` on Images reads PNG and JPEG. stb has no call that reports a header without the pixels, so `info()` reads the file header in PHP. The decoded surface is premultiplied ARGB, and PlutoVG's own `plutovg_convert_argb_to_rgba()` writes it into the frame as straight R, G, B, A, address to address, a row at a time when the frame's rows are padded. An opaque pixel matches the file; a partial pixel is divided back as PlutoVG divides, `(channel × 255) ÷ alpha`. PlutoVG has no straight B, G, R, A output, so the decoder takes RGBA frames only, and Images refuses it for a BGRA frame by name. BMP, GIF, TGA, PSD, HDR, PIC and PNM are in this stb and are not formats Images names. TIFF is not read.
+
 ## Painting
 
 `PlutoPaintingDriver` is VelvetGE's painter with `PlutoBrush`. The brush takes anti-aliased `path`, `gradpath`, `polyline`, `ellipse`, `ring`, `roundrect` and `roundring` commands drawn into 32-bit memory (any of the four channel orders, top row first). Each shape is lowered by PlutoVG's rasterizer, so curves are PlutoVG geometry. On B G R A memory a solid shape is drawn in place by PlutoVG; otherwise, and for every gradient, PlutoVG draws its coverage and ext-plutovg blends that with VelvetGE's arithmetic (`plutovg_surface_blend_colour()`, gradients through `plutovg_surface_blend_ramp()` sampling VelvetGE's ramp). Hard edges, clears, shadows, glass, layers, images, glyphs and spans go to VelvetGE's painter, which rasterizes with PlutoVG unless another rasterizer is given.
